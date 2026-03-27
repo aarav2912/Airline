@@ -1,12 +1,11 @@
 package airline;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 
 public class Flight {
+
     private String flightNumber;
     private String airline;
     private String origin;
@@ -18,24 +17,28 @@ public class Flight {
     private double baseBusinessPrice;
 
     private Map<String, Boolean> seats = new HashMap<>();
+
+    // 🔥 NEW: Locking system
+    private Set<String> seatsBeingBooked = new HashSet<>();
+    private Map<String, Long> seatLockTime = new HashMap<>();
+
+    private static final long LOCK_TIMEOUT = 30 * 1000; // 30 seconds
+
     private static final int BUSINESS_ROWS = 4;
     private static final int ECONOMY_ROWS = 20;
 
     private LocalDate flightDate = LocalDate.now();
-
-    // Whether this leg is part of a round trip bundle
     private boolean isRoundTripLeg = false;
 
-    // Round trip discount tiers — applied on top of dynamic pricing
-    // The further out you book both legs, the bigger the bundle saving
-    private static final double RT_DISCOUNT_LASTMINUTE = 0.03; // only 3% off if very close
-    private static final double RT_DISCOUNT_SHORT      = 0.07; // 7% off within 7 days
-    private static final double RT_DISCOUNT_MEDIUM     = 0.10; // 10% off within 30 days
-    private static final double RT_DISCOUNT_ADVANCE    = 0.15; // 15% off beyond 30 days (best deal)
+    private static final double RT_DISCOUNT_LASTMINUTE = 0.03;
+    private static final double RT_DISCOUNT_SHORT      = 0.07;
+    private static final double RT_DISCOUNT_MEDIUM     = 0.10;
+    private static final double RT_DISCOUNT_ADVANCE    = 0.15;
 
     public Flight(String flightNumber, String airline, String origin, String destination,
                   String departureTime, String arrivalTime, String duration,
                   double economyPrice, double businessPrice) {
+
         this.flightNumber = flightNumber;
         this.airline = airline;
         this.origin = origin;
@@ -45,7 +48,9 @@ public class Flight {
         this.duration = duration;
         this.baseEconomyPrice = economyPrice;
         this.baseBusinessPrice = businessPrice;
+
         initSeats();
+        startLockCleaner(); // 🔥 NEW
     }
 
     public void setFlightDate(LocalDate date) {
@@ -60,7 +65,7 @@ public class Flight {
 
     public boolean isRoundTripLeg() { return isRoundTripLeg; }
 
-    // ── Dynamic urgency multiplier (same as before) ──────────────────
+    // ---------------- PRICING ----------------
 
     private double getUrgencyMultiplier() {
         long daysUntil = ChronoUnit.DAYS.between(LocalDate.now(), flightDate);
@@ -85,10 +90,6 @@ public class Flight {
         return getUrgencyMultiplier() * getDemandMultiplier();
     }
 
-    /**
-     * Round-trip discount: slides based on how far in advance the flight is.
-     * The idea: airlines reward advance round-trip planners more than last-minute ones.
-     */
     private double getRoundTripDiscount() {
         if (!isRoundTripLeg) return 0.0;
         long daysUntil = ChronoUnit.DAYS.between(LocalDate.now(), flightDate);
@@ -117,10 +118,6 @@ public class Flight {
     public double getBaseEconomyPrice()  { return baseEconomyPrice; }
     public double getBaseBusinessPrice() { return baseBusinessPrice; }
 
-    /**
-     * How much is saved per seat vs one-way pricing for this leg.
-     * Used by HomeScreen to display the "You save ₹X per seat" badge.
-     */
     public double getEconomyRoundTripSaving() {
         if (!isRoundTripLeg) return 0;
         double oneWayPrice = rounded(baseEconomyPrice * getPriceMultiplier());
@@ -133,7 +130,6 @@ public class Flight {
         return oneWayPrice - getBusinessPrice();
     }
 
-    /** Round trip discount % as a readable string e.g. "15%" */
     public String getRoundTripDiscountLabel() {
         double pct = getRoundTripDiscount() * 100;
         return (int) pct + "%";
@@ -161,56 +157,108 @@ public class Flight {
         return tag;
     }
 
-    // ── Seat operations ──────────────────────────────────────────────
+    // ---------------- SEAT SYSTEM ----------------
 
     private void initSeats() {
         for (int row = 1; row <= BUSINESS_ROWS; row++)
             for (char col : new char[]{'A', 'B', 'C', 'D'})
                 seats.put("B" + row + col, false);
+
         for (int row = 1; row <= ECONOMY_ROWS; row++)
             for (char col : new char[]{'A', 'B', 'C', 'D', 'E', 'F'})
                 seats.put("E" + row + col, false);
-        java.util.Random rand = new java.util.Random();
-        for (String key : new java.util.ArrayList<>(seats.keySet()))
-            if (rand.nextDouble() < 0.30)
-                seats.put(key, true);
     }
 
-    public boolean bookSeat(String seatId) {
-        if (seats.containsKey(seatId) && !seats.get(seatId)) {
-            seats.put(seatId, true);
-            return true;
+    // 🔐 Try lock
+    public synchronized boolean tryLockSeat(String seatId) {
+
+        if (!seats.containsKey(seatId) || seats.get(seatId)) return false;
+
+        if (seatsBeingBooked.contains(seatId)) {
+            if (isLockExpired(seatId)) {
+                seatsBeingBooked.remove(seatId);
+                seatLockTime.remove(seatId);
+            } else return false;
         }
-        return false;
-    }
 
-    public boolean bookSeats(List<String> seatIds) {
-        for (String s : seatIds)
-            if (!seats.containsKey(s) || seats.get(s)) return false;
-        for (String s : seatIds)
-            seats.put(s, true);
+        seatsBeingBooked.add(seatId);
+        seatLockTime.put(seatId, System.currentTimeMillis());
         return true;
     }
 
-    public void cancelSeats(List<String> seatIds) {
+    // 🔓 Release
+    public synchronized void releaseSeat(String seatId) {
+        seatsBeingBooked.remove(seatId);
+        seatLockTime.remove(seatId);
+        notifyAll();
+    }
+
+    // ⏳ Remaining time (UI)
+    public synchronized long getRemainingLockTime(String seatId) {
+        if (!seatLockTime.containsKey(seatId)) return 0;
+        long elapsed = System.currentTimeMillis() - seatLockTime.get(seatId);
+        return Math.max(LOCK_TIMEOUT - elapsed, 0);
+    }
+
+    private boolean isLockExpired(String seatId) {
+        return getRemainingLockTime(seatId) <= 0;
+    }
+
+    // ✅ Final booking
+    public synchronized boolean bookSeats(List<String> seatIds) {
         for (String s : seatIds)
-            if (seats.containsKey(s))
-                seats.put(s, false);
+            if (!seats.containsKey(s) || seats.get(s)) return false;
+
+        for (String s : seatIds) {
+            seats.put(s, true);
+            seatsBeingBooked.remove(s);
+            seatLockTime.remove(s);
+        }
+
+        notifyAll();
+        return true;
+    }
+
+    public synchronized void cancelSeats(List<String> seatIds) {
+        for (String s : seatIds)
+            seats.put(s, false);
+        notifyAll();
+    }
+
+    private void startLockCleaner() {
+        Thread t = new Thread(() -> {
+            while (true) {
+                synchronized (this) {
+                    for (String s : new HashSet<>(seatsBeingBooked)) {
+                        if (isLockExpired(s)) {
+                            seatsBeingBooked.remove(s);
+                            seatLockTime.remove(s);
+                        }
+                    }
+                    notifyAll();
+                }
+
+                try { Thread.sleep(5000); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        });
+
+        t.setDaemon(true);
+        t.start();
     }
 
     public boolean isSeatBooked(String seatId) { return seats.getOrDefault(seatId, true); }
-    public Map<String, Boolean> getSeats()      { return seats; }
+    public Map<String, Boolean> getSeats() { return seats; }
 
     public int getAvailableEconomy() {
         return (int) seats.entrySet().stream()
                 .filter(e -> e.getKey().startsWith("E") && !e.getValue()).count();
     }
+
     public int getAvailableBusiness() {
         return (int) seats.entrySet().stream()
                 .filter(e -> e.getKey().startsWith("B") && !e.getValue()).count();
     }
-
-    // ── Getters ──────────────────────────────────────────────────────
 
     public String getFlightNumber()  { return flightNumber; }
     public String getAirline()       { return airline; }
